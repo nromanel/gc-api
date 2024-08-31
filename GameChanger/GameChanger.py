@@ -24,13 +24,15 @@ import sys
 
 GC_LOGIN = "https://web.gc.com/?redirect=%2Fteams"
 
+RETRY = 2
+
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,format='%(asctime)s %(levelname)-8s %(message)s')
 log=logging.getLogger(__name__)
 
 
 class GameChanger(object):
 
-    def __init__(self,username=None,password=None,gmail_token='token.json',gmail_creds='google-creds.json',chrome_data_dir="./chrome-data"):
+    def __init__(self,username=None,password=None,team_name=None,gmail_token='token.json',gmail_creds='google-creds.json',chrome_data_dir="./chrome-data"):
         log.info("Initializing GC Session")
         options = Options()
         options.add_argument('--headless=new')
@@ -56,8 +58,37 @@ class GameChanger(object):
             gc_tokens = self.auth_gc(username,password,gmail_token,gmail_creds)
             self.tokens = gc_tokens
             self.request_session.headers.update(gc_tokens)
+            
+        teams = self.get_team_details()
+        found_team = False
+        for team in teams:
+            if team_name in team["name"]:
+                self.team_id = team["id"]
+                found_team = True
+                break
+        if found_team == False:
+            Exception("Unable to Find Team")
 
         log.info("GC Session Established")
+        
+    def refresh_gc_token(self):
+        self.driver.get(GC_LOGIN)
+        time.sleep(2)
+
+        log.info("Find Existing GC Session")
+        gc_tokens = self.find_gc_token()
+        if "gc-token" in gc_tokens and ("redirect" not in self.driver.current_url and "teams" in self.driver.current_url):
+            log.info("Existing Session Found!")
+            log.info(gc_tokens)
+            self.tokens = gc_tokens
+            self.request_session.headers.update(gc_tokens)
+        else:
+            log.info("No Existing GC Session Found. Logging in.")
+            gc_tokens = self.auth_gc(username,password,gmail_token,gmail_creds)
+            self.tokens = gc_tokens
+            self.request_session.headers.update(gc_tokens)
+        
+        return True
 
     def get_team_details(self):
         TEAM_DETAILS_URL = "https://api.team-manager.gc.com/me/teams?include=user_team_associations"
@@ -71,20 +102,31 @@ class GameChanger(object):
                                 "season_name" : team["season_name"]})
         return output
 
-    def get_live_game_summary(self,team_id):
-        GAME_SUMMARIES_URL = "https://api.team-manager.gc.com/teams/{}/game-summaries".format(team_id)
-        result = self.request_session.get(GAME_SUMMARIES_URL)
-        output = {}
-        for game in result.json():
-            if game["game_status"] == "live":
-                output["id"] = game["event_id"]
-                output["home_away"] = game["home_away"]
-                output["owning_team_score"] = game["owning_team_score"]
-                output["opponent_team_score"] = game["opponent_team_score"]
-                output["current_inning"] = game["sport_specific"]["bats"]["inning_details"]["inning"]
-                output["current_outs"] = game["sport_specific"]["bats"]["total_outs"] % 3
-                break
-        return output
+    def get_live_game_summary(self):
+        GAME_SUMMARIES_URL = "https://api.team-manager.gc.com/teams/{}/game-summaries".format(self.team_id)
+        
+        attempt = 0
+        while attempt < RETRY:
+            result = self.request_session.get(GAME_SUMMARIES_URL)
+            
+            if result.status_code != 200:
+                update = self.refresh_gc_token()
+                attempt = attempt + 1
+                continue
+            
+            output = {}
+            for game in result.json():
+                if game["game_status"] == "live":
+                    output["id"] = game["event_id"]
+                    output["home_away"] = game["home_away"]
+                    output["owning_team_score"] = game["owning_team_score"]
+                    output["opponent_team_score"] = game["opponent_team_score"]
+                    output["current_inning"] = game["sport_specific"]["bats"]["inning_details"]["inning"]
+                    output["current_outs"] = game["sport_specific"]["bats"]["total_outs"] % 3
+                    break
+            return output
+        
+        Exception("Unable to Retrieve Game Summary")
     
     def get_game_stream(self,game_id):
         STREAM_URL = "https://api.team-manager.gc.com/events/{}/best-game-stream-id".format(game_id)
